@@ -1,2 +1,5 @@
 # Ignore OpenRouter models state file created by monitor_openrouter_models.sh
 .openrouter_models_last.json
+
+# Ignore local environment configuration (use .env.example instead)
+.env
