@@ -1,0 +1,2 @@
+# Ignore OpenRouter models state file created by monitor_openrouter_models.sh
+.openrouter_models_last.json
