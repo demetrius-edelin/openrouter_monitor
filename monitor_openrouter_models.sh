@@ -3,7 +3,7 @@
 # monitor_openrouter_models.sh
 #
 # Cron-friendly script to monitor https://openrouter.ai/models for newly
-# listed models and send a Slack notification for any additions.
+# listed models and send a Slack and/or Telegram notification for any additions.
 #
 # Usage (example cron, runs every 15 minutes):
 #   */15 * * * * /usr/bin/env bash /path/to/monitor_openrouter_models.sh
@@ -14,7 +14,10 @@
 # - On the very first run, it only initializes the baseline and does NOT
 #   send notifications (to avoid spamming with all existing models).
 # - Requires: bash, curl, jq
-# - Slack webhook URL is loaded from .env via SLACK_WEBHOOK_URL.
+# - The script loads the notification configuration from .env:
+#   - SLACK_WEBHOOK_URL for Slack.
+#   - TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID for Telegram.
+#   Set one channel or both channels.
 #
 
 set -euo pipefail
@@ -37,8 +40,21 @@ if [[ -f "${ENV_FILE}" ]]; then
   export $(grep -v '^#' "${ENV_FILE}" | xargs -0 -I {} bash -c 'printf "%s\n" "{}"' 2>/dev/null || true)
 fi
 
-# Slack Incoming Webhook URL must be set via environment / .env
-: "${SLACK_WEBHOOK_URL:?SLACK_WEBHOOK_URL is not set. Define it in .env or the environment.}"
+# Notification channels. Each channel is optional, but you must set at least one.
+SLACK_WEBHOOK_URL="${SLACK_WEBHOOK_URL:-}"
+TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+
+if [[ -n "${TELEGRAM_BOT_TOKEN}" && -z "${TELEGRAM_CHAT_ID}" ]] ||
+  [[ -z "${TELEGRAM_BOT_TOKEN}" && -n "${TELEGRAM_CHAT_ID}" ]]; then
+  echo "Error: Set both TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID, or set neither." >&2
+  exit 1
+fi
+
+if [[ -z "${SLACK_WEBHOOK_URL}" && -z "${TELEGRAM_BOT_TOKEN}" ]]; then
+  echo "Error: No notification channel is set. Define SLACK_WEBHOOK_URL or TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env or the environment." >&2
+  exit 1
+fi
 
 # ------------- Configuration -------------
 
@@ -77,6 +93,44 @@ send_slack_message() {
     -H "Content-Type: application/json" \
     -d "$(jq -n --arg text "$text" '{text: $text}')" \
     >/dev/null || log "Warning: Failed to send Slack notification"
+}
+
+# Telegram rejects a message that has more than 4096 characters.
+# Use a lower limit to keep a safety margin.
+TELEGRAM_MAX_CHARS=4000
+
+post_telegram_chunk() {
+  local text=$1
+
+  curl -sS --fail -X POST \
+    --max-time 15 \
+    "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+    --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+    --data-urlencode "text=${text}" \
+    --data-urlencode "disable_web_page_preview=true" \
+    >/dev/null || log "Warning: Failed to send Telegram notification"
+}
+
+send_telegram_message() {
+  local text=$1
+  local chunk=""
+  local line
+
+  # Divide the text at line breaks so that each message stays below the limit.
+  while IFS= read -r line; do
+    if [[ -n "$chunk" && $((${#chunk} + ${#line} + 1)) -gt ${TELEGRAM_MAX_CHARS} ]]; then
+      post_telegram_chunk "$chunk"
+      chunk=""
+    fi
+    if [[ -z "$chunk" ]]; then
+      chunk="$line"
+    else
+      chunk+=$'\n'"$line"
+    fi
+  done < <(printf '%s\n' "$text")
+
+  [[ -n "$chunk" ]] && post_telegram_chunk "$chunk"
+  return 0
 }
 
 # ------------- Main Logic -------------
@@ -157,8 +211,14 @@ done < <(printf '%s\n' "$NEW_IDS")
 
 MESSAGE="New OpenRouter model(s) detected:${NEW_LIST_TEXT}"
 
-# 7) Send Slack notification
-send_slack_message "$MESSAGE"
+# 7) Send notifications to each channel that has a configuration
+if [[ -n "${SLACK_WEBHOOK_URL}" ]]; then
+  send_slack_message "$MESSAGE"
+fi
+
+if [[ -n "${TELEGRAM_BOT_TOKEN}" ]]; then
+  send_telegram_message "$MESSAGE"
+fi
 
 # 8) Update state
 printf '%s\n' "$CURRENT_IDS" >"$STATE_FILE"
